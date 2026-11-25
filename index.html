@@ -120,6 +120,9 @@ table.mx td:first-child{text-align:right;font-weight:700}
 .meal.late{border-color:var(--warn);border-style:solid;background:#fff1f1}
 .meal.late .ms{color:var(--warn);font-weight:700}
 .feedlog{margin-top:12px}
+.mnote{font-size:11px;color:var(--ink);opacity:.75;line-height:1.3;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;margin-top:2px}
+.chip:disabled{opacity:.55;cursor:default}
+.fam{border-top:1px solid var(--line);padding-top:14px;margin-top:16px}
 .feedlog summary{cursor:pointer;font-size:14px;font-weight:500;color:var(--muted)}
 .cell.miss{background:#fee2e2;color:var(--warn)}
 .big-emoji{font-size:110px;animation:jump .5s ease-in-out infinite alternate}
@@ -219,6 +222,8 @@ const MEALS = [
   {id:'dinner',  name:'ארוחת ערב',         short:'ערב',    icon:'🥣', from:18},
   {id:'veggies', name:'ירקות לפני השינה',  short:'ירקות',  icon:'🥕', from:21.5},
 ];
+const PARENTS = ['abba','ima'];   // מי מורשה לשנות הגדרות משפחה
+const NOTE_MEALS = ['lunch','dinner'];
 const M = id => MEALS.find(m=>m.id===id) || {id,name:id,short:id,icon:'🍽️',from:0};
 
 /* ---------- utils ---------- */
@@ -279,10 +284,27 @@ const META = 'id,walk_date,slot,walker,started_at,ended_at,status,note,has_photo
 const Store = {
   mode:'demo', sb:null, photoCache:{}, _mem:null,
   configured(){ return !!(CONFIG.SUPABASE_URL && CONFIG.SUPABASE_ANON_KEY && window.supabase); },
-  connect(key){
+  connect(key, parentKey){
+    const headers={'x-family-key':key}; if(parentKey) headers['x-parent-key']=parentKey;
     this.sb = window.supabase.createClient(CONFIG.SUPABASE_URL, CONFIG.SUPABASE_ANON_KEY,
-      {auth:{persistSession:false}, global:{headers:{'x-family-key':key}}});
+      {auth:{persistSession:false}, global:{headers}});
     this.mode='cloud';
+  },
+  async getSettings(){
+    const def={participants:WALKERS.map(w=>w.id)}; let v={};
+    if(this.mode==='cloud'){
+      const {data,error}=await this.sb.from('app_settings').select('value').eq('key','family').maybeSingle();
+      if(!error && data) v=data.value||{};
+    } else v=LS.get('luna_demo_settings',{});
+    const s={...def,...v}; s.participants=(s.participants||[]).filter(id=>WALKERS.some(w=>w.id===id));
+    if(!s.participants.length) s.participants=def.participants; return s;
+  },
+  async saveSettings(v,by){
+    if(this.mode==='cloud'){
+      const {error}=await this.sb.from('app_settings').upsert({key:'family', value:v, updated_by:by, updated_at:new Date().toISOString()});
+      if(error) throw error; return;
+    }
+    LS.set('luna_demo_settings',v);
   },
   async checkKey(){ const {data,error}=await this.sb.rpc('is_family'); if(error) throw error; return data===true; },
   _load(){ if(!this._mem){ this._mem = LS.get('luna_demo',null) || seedDemo(); this._save(); } return this._mem; },
@@ -342,7 +364,10 @@ const Store = {
     return this._loadF().filter(f=>f.feed_date>=from).map(f=>({...f}));
   },
   async addFeed(f){
-    if(this.mode==='cloud'){ const {data,error}=await this.sb.from('feedings').insert(f).select('*').single(); if(error) throw error; return data; }
+    if(this.mode==='cloud'){
+      let {data,error}=await this.sb.from('feedings').insert(f).select('*').single();
+      if(error && /note/.test(error.message||'') && 'note' in f){ const {note,...g}=f; ({data,error}=await this.sb.from('feedings').insert(g).select('*').single()); if(!error) toast('ההערה לא נשמרה – צריך להריץ את קובץ העדכון ב-Supabase'); }
+      if(error) throw error; return data; }
     const row={...f, id:uuid(), created_at:new Date().toISOString()}; this._loadF().push(row); this._saveF(); return row;
   },
   async updateFeed(id,p){
@@ -399,7 +424,7 @@ function seedDemoFeed(){
 }
 
 /* ---------- state ---------- */
-const state = { walks:[], feeds:[], live:null, tab:'today', range:7, me:null, err:null, album:null };
+const state = { walks:[], feeds:[], settings:{participants:WALKERS.map(w=>w.id)}, live:null, tab:'today', range:7, me:null, err:null, album:null };
 let sheet=null, timerId=null, pollId=null;
 
 /* ---------- toast / dialogs ---------- */
@@ -453,6 +478,7 @@ async function refresh(){
   try{
     state.walks = await Store.list(addDays(todayL(),-35));
     state.feeds = await Store.listFeed(addDays(todayL(),-10));
+    try{ state.settings = await Store.getSettings(); }catch(e){}
     state.live = state.walks.filter(w=>w.status==='live').sort((a,b)=>new Date(b.started_at)-new Date(a.started_at))[0] || null;
     state.err=null;
   }catch(e){ state.err = 'בעיה בטעינת הנתונים: '+(e.message||e); }
@@ -480,8 +506,9 @@ function countsSince(from){
     const last=mine.reduce((m,w)=> (w.walk_date+SLOT_ORDER[w.slot])>m ? (w.walk_date+SLOT_ORDER[w.slot]) : m, '');
     return {p, n:mine.length, last}; });
 }
+const participants = () => WALKERS.filter(w=>state.settings.participants.includes(w.id));
 function whoseTurn(){
-  const c=countsSince(addDays(todayL(),-6));
+  const c=countsSince(addDays(todayL(),-6)).filter(r=>state.settings.participants.includes(r.p.id));
   c.sort((a,b)=> a.n-b.n || a.last.localeCompare(b.last));
   return c[0].p;
 }
@@ -541,7 +568,7 @@ function renderFeedCard(){
   const fs=state.feeds.filter(f=>f.feed_date===t);
   let html=`<section class="card"><h3>🍽️ האוכל של לונה היום</h3><div class="meals">${MEALS.map(m=>{
     const f=fs.find(x=>x.meal===m.id);
-    if(f){ const p=W(f.fed_by); return `<button class="meal done" style="--c:${p.color}" data-feed="${f.id}"><span class="mi">${m.icon}</span><b>${m.short}</b><span class="ms">✓ ${esc(p.name)}${f.fed_at?' · '+hm(f.fed_at):''}</span></button>`; }
+    if(f){ const p=W(f.fed_by); return `<button class="meal done" style="--c:${p.color}" data-feed="${f.id}"><span class="mi">${m.icon}</span><b>${m.short}</b><span class="ms">✓ ${esc(p.name)}${f.fed_at?' · '+hm(f.fed_at):''}</span>${f.note?`<span class="mnote">${esc(f.note)}</span>`:''}</button>`; }
     const late=nh>=m.from+3, due=nh>=m.from;
     return `<button class="meal ${late?'late':due?'due':''}" data-feed-add="${m.id}"><span class="mi">${m.icon}</span><b>${m.short}</b><span class="ms">${late?'⚠️ עוד לא אכלה!':due?'⏰ הגיע הזמן':'בהמשך'}</span></button>`;
   }).join('')}</div>`;
@@ -550,7 +577,7 @@ function renderFeedCard(){
   let miss=0;
   const rows=days.map(d=>`<div class="dl">${dayLabel(d)}</div>`+MEALS.map(m=>{
     const f=state.feeds.find(x=>x.feed_date===d&&x.meal===m.id);
-    if(f){ const p=W(f.fed_by); return `<button class="cell" style="background:${p.color}" data-feed="${f.id}" title="${esc(p.name)} ${hm(f.fed_at)}">${esc(p.name[0])}</button>`; }
+    if(f){ const p=W(f.fed_by); return `<button class="cell" style="background:${p.color}" data-feed="${f.id}" title="${esc(p.name)} ${hm(f.fed_at)}${f.note?' – '+esc(f.note):''}">${esc(p.name[0])}</button>`; }
     miss++; return `<button class="cell miss" data-feed-day="${d}|${m.id}">✗</button>`;
   }).join('')).join('');
   html+=`<details class="feedlog"><summary>${miss?`⚠️ ${miss} ארוחות לא נרשמו בשבוע האחרון`:'✅ אין פספוסים בשבוע האחרון'}</summary>
@@ -568,7 +595,7 @@ function openFeedSheet(opt={}){
   const date=f.feed_date||opt.date||ln.date;
   sheet={kind:'feed', mode:f.id?'edit':'add', id:f.id, walker:f.fed_by||state.me||WALKERS[0].id,
     meal:f.meal||opt.meal||suggestMeal(), date,
-    time: f.id ? hm(f.fed_at) : (date===ln.date ? hm(new Date().toISOString()) : ''), orig:f};
+    time: f.id ? hm(f.fed_at) : (date===ln.date ? hm(new Date().toISOString()) : ''), note:f.note||'', orig:f};
   drawFeedSheet();
 }
 function drawFeedSheet(){
@@ -584,13 +611,15 @@ function drawFeedSheet(){
     <div class="row2 field">
       <div><label class="l">תאריך</label><input class="inp" type="date" id="fDate" value="${s.date}" max="${ymd(new Date())}"></div>
       <div><label class="l">שעה</label><input class="inp" type="time" id="fTime" value="${s.time}"></div></div>
+    <div class="field" id="fNoteWrap" ${NOTE_MEALS.includes(s.meal)?'':'hidden'}><label class="l">מה קיבלה?</label>
+      <textarea class="inp" id="fNote" rows="2" maxlength="200" placeholder="למשל: כוס אוכל יבש + חצי חזה עוף">${esc(s.note)}</textarea></div>
     <div class="sheet-actions">
       <button class="btn pri wide" data-act="save">${s.mode==='edit'?'שמירה ✔️':'😋 לונה אכלה!'}</button>
       ${s.mode==='edit'?`<button class="btn danger wide" data-act="delete">מחיקה</button>`:''}
       <button class="btn ghost wide" data-act="close">סגירה</button>
     </div></div>`;
   o.addEventListener('click',e=>{ if(e.target===o) closeSheet(); });
-  o.addEventListener('input',e=>{ if(e.target.id==='fDate') sheet.date=e.target.value; if(e.target.id==='fTime') sheet.time=e.target.value; });
+  o.addEventListener('input',e=>{ if(e.target.id==='fDate') sheet.date=e.target.value; if(e.target.id==='fTime') sheet.time=e.target.value; if(e.target.id==='fNote') sheet.note=e.target.value; });
   document.body.appendChild(o);
 }
 async function saveFeed(btn){
@@ -601,6 +630,8 @@ async function saveFeed(btn){
     let at=null;
     if(s.time){ const d=new Date(s.date+'T'+s.time); if(d.getHours()<4) d.setDate(d.getDate()+1); at=d.toISOString(); }
     const row={feed_date:s.date, meal:s.meal, fed_by:s.walker, fed_at:at};
+    const note=NOTE_MEALS.includes(s.meal) ? (s.note||'').trim() : '';
+    if(note || s.mode==='edit') row.note = note || null;
     if(s.mode==='add'){
       const dup=state.feeds.find(x=>x.feed_date===s.date&&x.meal===s.meal);
       if(dup && !await confirmDlg(`${M(s.meal).name} כבר נרשמה – ${esc(W(dup.fed_by).name)}${dup.fed_at?' ב-'+hm(dup.fed_at):''}. לרשום שוב?`,'לרשום שוב')){ btn.disabled=false; return; }
@@ -620,11 +651,13 @@ function miniParty(emoji,title,sub){
 function renderFair(){
   const R=state.range, t=todayL(), from=addDays(t,-(R-1)), now=logicalNow();
   const ws=doneWalks().filter(w=>w.walk_date>=from);
-  const rows=WALKERS.map(p=>{ const mine=ws.filter(w=>w.walker===p.id);
+  const parts=participants(), partIds=new Set(parts.map(p=>p.id));
+  const others=WALKERS.filter(p=>!partIds.has(p.id)).map(p=>({p,n:ws.filter(w=>w.walker===p.id).length})).filter(o=>o.n);
+  const rows=parts.map(p=>{ const mine=ws.filter(w=>w.walker===p.id);
     const mins=mine.map(durMin).filter(Boolean);
     return {p, n:mine.length, slots:SLOTS.map(s=>mine.filter(w=>w.slot===s.id).length),
       avg: mins.length? Math.round(mins.reduce((a,b)=>a+b,0)/mins.length):null}; });
-  const total=ws.length, fair=total/WALKERS.length, max=Math.max(1,...rows.map(r=>r.n));
+  const total=ws.length, ptotal=rows.reduce((a,r)=>a+r.n,0), fair=ptotal/Math.max(1,parts.length), max=Math.max(1,...rows.map(r=>r.n));
   // possible slots so far
   let possible=0; for(let i=0;i<R;i++){ const d=addDays(t,-i); possible += d===now.date ? SLOT_ORDER[now.slot]+1 : 4; }
   const covered=new Set(ws.map(w=>w.walk_date+'|'+w.slot)).size;
@@ -645,9 +678,9 @@ function renderFair(){
         <span class="avatar" style="background:${r.p.color}">${esc(r.p.name[0])}</span>
         <div><div class="lb-name"><span>${esc(r.p.name)}</span><span>${r.n}${r.avg?` <small style="color:var(--muted);font-weight:500">· ~${r.avg} דק׳</small>`:''}</span></div>
           <div class="bar"><i style="width:${r.n/max*100}%"></i></div></div>
-        <span class="diff ${cls}">${total?lbl:'—'}</span>
+        <span class="diff ${cls}">${ptotal?lbl:'—'}</span>
       </div>`; }).join('')}
-    <div class="hint">חלק הוגן: ${Math.round(fair*10)/10} יציאות לכל אחד</div>
+    <div class="hint">חלק הוגן: ${Math.round(fair*10)/10} יציאות לכל אחד${others.length?`<br>לא משתתפים בטבלה: ${others.map(o=>`${esc(o.p.name)} (${o.n})`).join(', ')}`:''}</div>
   </section>
   <section class="card"><h3>📅 מי הוציא ומתי</h3>
     <div class="heat"><div></div>${SLOTS.map(s=>`<div class="hd">${s.icon}<br>${s.name}</div>`).join('')}
@@ -787,6 +820,7 @@ function openSettings(){
     <div class="field"><label class="l">מי משתמש בטלפון הזה?</label>
       <div class="chips">${WALKERS.map(p=>`<button class="chip ${state.me===p.id?'on':''}" style="--c:${p.color}" data-me="${p.id}"><span class="dot"></span>${esc(p.name)}</button>`).join('')}</div>
       <div class="hint">זה רק ממלא מראש את השם כשמסמנים יציאה.</div></div>
+    ${familySettingsHtml()}
     <div class="field"><label class="l">חיבור</label>
       <div class="hint" style="margin-top:0">${Store.mode==='cloud'?'✅ מחובר ל-Supabase – כל המשפחה רואה את אותם נתונים.':'מצב הדגמה (מקומי). כדי לחבר – למלא את CONFIG בראש הקובץ.'}</div></div>
     <div class="sheet-actions">
@@ -797,6 +831,41 @@ function openSettings(){
   document.body.appendChild(o);
 }
 
+function familySettingsHtml(){
+  const isParent=PARENTS.includes(state.me);
+  const needCode = isParent && Store.mode==='cloud' && !LS.get('luna_parent_key',null);
+  return `<div class="field fam"><label class="l">👨‍👩‍👧 הגדרות משפחה – מי משתתף בטבלת הצדק ובתור?</label>
+    <div class="chips">${WALKERS.map(p=>`<button class="chip ${state.settings.participants.includes(p.id)?'on':''}" style="--c:${p.color}" data-part="${p.id}" ${isParent?'':'disabled'}><span class="dot"></span>${esc(p.name)}</button>`).join('')}</div>
+    ${isParent?`
+      ${needCode?`<input class="inp" id="parentKey" type="password" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="קוד הורים" style="margin-top:10px">`:''}
+      <button class="btn pri wide" style="margin-top:10px" data-act="save-family">שמירת הגדרות משפחה</button>
+      <div class="hint">מי שלא משתתף עדיין יכול לסמן יציאות, אבל לא נספר בטבלה ובתור.</div>`
+    :`<div class="hint">🔒 רק אבא ואמא יכולים לשנות את ההגדרות האלה.</div>`}
+  </div>`;
+}
+async function saveFamilySettings(btn){
+  const sel=[...document.querySelectorAll('[data-part].on')].map(b=>b.dataset.part);
+  if(!sel.length){ toast('צריך לבחור לפחות משתתף אחד'); return; }
+  if(!PARENTS.includes(state.me)){ toast('רק אבא ואמא יכולים לשנות'); return; }
+  btn.disabled=true;
+  try{
+    if(Store.mode==='cloud'){
+      const fk=LS.get('luna_family_key','');
+      let pk=LS.get('luna_parent_key',null); const inp=document.getElementById('parentKey');
+      if(inp && inp.value.trim()) pk=inp.value.trim();
+      if(!pk){ toast('צריך להקליד קוד הורים'); btn.disabled=false; return; }
+      Store.connect(fk,pk);
+      const {data,error}=await Store.sb.rpc('is_parent');
+      if(error || data!==true){ LS.del('luna_parent_key'); Store.connect(fk,null);
+        toast(error?('שגיאה: '+error.message):'קוד ההורים לא נכון 🙈'); btn.disabled=false; return; }
+      LS.set('luna_parent_key',pk);
+    }
+    await Store.saveSettings({participants:sel}, state.me);
+    state.settings={...state.settings, participants:sel};
+    btn.closest('.overlay')?.remove(); toast('הגדרות המשפחה נשמרו ✔️'); render();
+  }catch(e){ console.error(e); toast('שגיאה בשמירה: '+(e.message||e)); btn.disabled=false; }
+}
+
 /* ---------- events ---------- */
 document.addEventListener('click', async e=>{
   const t=e.target.closest('button'); if(!t) return;
@@ -805,8 +874,10 @@ document.addEventListener('click', async e=>{
   if(d.range){ state.range=+d.range; render(); return; }
   if(d.walker && sheet){ sheet.walker=d.walker; t.parentNode.querySelectorAll('[data-walker]').forEach(b=>b.classList.toggle('on',b===t)); return; }
   if(d.slot && sheet){ sheet.slot=d.slot; t.parentNode.querySelectorAll('[data-slot]').forEach(b=>b.classList.toggle('on',b===t)); return; }
-  if(d.me){ state.me=d.me; LS.set('luna_me',d.me); t.parentNode.querySelectorAll('[data-me]').forEach(b=>b.classList.toggle('on',b===t)); render(); return; }
-  if(d.meal && sheet){ sheet.meal=d.meal; t.parentNode.querySelectorAll('[data-meal]').forEach(b=>b.classList.toggle('on',b===t)); return; }
+  if(d.me){ state.me=d.me; LS.set('luna_me',d.me); t.closest('.overlay')?.remove(); render(); openSettings(); return; }
+  if(d.meal && sheet){ sheet.meal=d.meal; t.parentNode.querySelectorAll('[data-meal]').forEach(b=>b.classList.toggle('on',b===t));
+    const nw=document.getElementById('fNoteWrap'); if(nw) nw.hidden=!NOTE_MEALS.includes(d.meal); return; }
+  if(d.part){ if(t.disabled) return; t.classList.toggle('on'); return; }
   if(d.feed){ const f=state.feeds.find(x=>x.id===d.feed); if(f) openFeedSheet({feed:f}); return; }
   if(d.feedAdd){ openFeedSheet({meal:d.feedAdd}); return; }
   if(d.feedDay){ const [dt,ml]=d.feedDay.split('|'); openFeedSheet({date:dt, meal:ml}); return; }
@@ -825,7 +896,8 @@ document.addEventListener('click', async e=>{
     case 'delete': if(await confirmDlg(sheet.kind==='feed'?'למחוק את ההאכלה הזו?':'למחוק את היציאה הזו?','מחיקה')){ try{ if(sheet.kind==='feed') await Store.removeFeed(sheet.id); else await Store.remove(sheet.id); closeSheet(); toast('נמחק'); state.album=null; await refresh(); }catch(err){ toast('שגיאה: '+err.message); } } break;
     case 'cancel-live': if(await confirmDlg('לבטל את הטיול? הוא לא יירשם.','לבטל')){ try{ await Store.remove(sheet.id); closeSheet(); await refresh(); }catch(err){ toast('שגיאה: '+err.message); } } break;
     case 'settings': openSettings(); break;
-    case 'logout': LS.del('luna_family_key'); location.reload(); break;
+    case 'save-family': saveFamilySettings(t); break;
+    case 'logout': LS.del('luna_family_key'); LS.del('luna_parent_key'); location.reload(); break;
     case 'reset-demo': if(await confirmDlg('לאפס את נתוני ההדגמה?','איפוס')){ LS.del('luna_demo'); LS.del('luna_demo_feed'); Store._mem=null; Store._memF=null; t.closest('.overlay')?.remove(); await refresh(); } break;
   }
 });
@@ -861,7 +933,7 @@ function showMeScreen(){
 async function boot(){
   if(Store.configured()){
     const k=LS.get('luna_family_key',null); if(!k) return showKeyScreen();
-    Store.connect(k);
+    Store.connect(k, LS.get('luna_parent_key',null));
     try{ if(!await Store.checkKey()){ LS.del('luna_family_key'); return showKeyScreen('הקוד השתנה – הזינו מחדש'); } }
     catch(err){ state.err='בעיית חיבור: '+(err.message||err); }
   }
